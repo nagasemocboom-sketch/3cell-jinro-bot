@@ -1,3 +1,11 @@
+// Render無料枠(Web Service)用のダミーサーバー機能
+const http = require('http');
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Bot is active!');
+}).listen(process.env.PORT || 3000);
+
+
 const { 
   Client, 
   GatewayIntentBits, 
