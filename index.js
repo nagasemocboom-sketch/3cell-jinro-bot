@@ -5,7 +5,6 @@ http.createServer((req, res) => {
   res.end('Bot is active!');
 }).listen(process.env.PORT || 3000);
 
-
 const { 
   Client, 
   GatewayIntentBits, 
@@ -26,7 +25,6 @@ const client = new Client({
   ]
 });
 
-// 環境変数、または直接設定
 const TOKEN = process.env.DISCORD_TOKEN || 'YOUR_BOT_TOKEN_HERE';
 
 const ROLES = {
@@ -62,21 +60,22 @@ const RULE_TEXT = `
 const HOST_GUIDE_TEXT = `
 🛠️ **【主催者（GM）用 Bot操作ガイド】**
 --------------------------------------------------
-・**\`!jinro-start\`**: ゲームを開始します。（要：ボイスチャンネルに12名接続）
-・**\`!jinro-stop\`**: ゲームを緊急強制終了し、Botが生成したカテゴリー・チャンネルを削除して初期化します。
+・**\`!jinro-setup\`**: 部屋作成・ルール案内を投稿します（人数不問）。
+・**\`!jinro-start\`**: ゲームを開始します（要：全体会議VCに12名接続）。
+・**\`!jinro-stop\`**: ゲームを強制終了し、Botが生成したカテゴリー・全チャンネルを削除して初期化します。
 
 ・**事前確認チェックリスト**:
   1. 参加者全員のDiscord設定で「サーバーメンバーからのダイレクトメッセージ（DM）許可」がONになっているか確認してください。
-  2. Botに「管理者 (Administrator)」権限が付与されているか確認してください。
+  2. Botに必要な権限（チャンネル管理、メンバー移動、ミュート等）が付与されているか確認してください。
 --------------------------------------------------
 `;
 
-// サーバーごとにゲーム状態を分離保持
 const games = new Map();
 
 function getGame(guildId) {
   if (!games.has(guildId)) {
     games.set(guildId, {
+      setupDone: false,
       active: false,
       phase: 'LOBBY',
       dayCount: 0,
@@ -107,37 +106,34 @@ client.on('messageCreate', async (message) => {
 
   const gameState = getGame(message.guild.id);
 
+  if (message.content === '!jinro-setup') {
+    if (gameState.setupDone) {
+      return message.reply('既にセットアップ済みです。全体会議VCに12名入った状態で `!jinro-start` と入力してください。');
+    }
+    await handleSetupCommand(message.guild, message.channel, gameState);
+  }
+
   if (message.content === '!jinro-start') {
-    if (gameState.active) return message.reply('既にゲームが開始されています。');
-    await setupAndStartGame(message.guild, message.channel, gameState);
+    if (!gameState.setupDone) {
+      return message.reply('先に `!jinro-setup` を実行してゲームエリアを作成してください。');
+    }
+    if (gameState.active) {
+      return message.reply('既にゲームが進行中です。終了するには `!jinro-stop` を使用してください。');
+    }
+    await handleStartCommand(message.guild, message.channel, gameState);
   }
 
   if (message.content === '!jinro-stop') {
-    if (!gameState.active) return message.reply('ゲームは開始していません。');
+    if (!gameState.setupDone && !gameState.active) {
+      return message.reply('ゲーム環境は作成されていません。');
+    }
     await cleanUpAndReset(message.guild, gameState);
-    message.reply('ゲームを強制終了し、チャンネルと状態をクリアしました。');
+    message.reply('ゲームを強制終了し、作成したチャンネルを削除・初期化しました。');
   }
 });
 
-async function setupAndStartGame(guild, originChannel, gameState) {
-  const vcMembers = originChannel.members ? originChannel.members.filter(m => !m.user.bot && m.voice.channel) : [];
-  if (vcMembers.size < 12) {
-    return originChannel.send(`【エラー】現在ボイスチャンネルに12人居ません。（現在: ${vcMembers.size}名）`);
-  }
-
-  gameState.active = true;
-  gameState.dayCount = 0;
-  gameState.lastKilledTeam = null;
-  gameState.consecutiveKills = 0;
-  gameState.executedYesterday = null;
-
-  const memberArray = Array.from(vcMembers.values()).slice(0, 12);
-  const shuffledMembers = memberArray.sort(() => Math.random() - 0.5);
-
-  const teamRoles = [ROLES.SEER, ROLES.MEDIUM, ROLES.CITIZEN, ROLES.WOLF].sort(() => Math.random() - 0.5);
-  const playerRoles = [];
-  teamRoles.forEach(role => playerRoles.push(role, role, role));
-
+// --- セットアップコマンド（部屋・ルールの生成） ---
+async function handleSetupCommand(guild, originChannel, gameState) {
   try {
     const category = await guild.channels.create({ name: 'スリーマンセル人狼', type: ChannelType.GuildCategory });
     const mainText = await guild.channels.create({ name: '全体議論チャット', type: ChannelType.GuildText, parent: category.id });
@@ -146,7 +142,54 @@ async function setupAndStartGame(guild, originChannel, gameState) {
     gameState.channels.category = category;
     gameState.channels.mainText = mainText;
     gameState.channels.mainVoice = mainVoice;
+    gameState.setupDone = true;
 
+    await mainText.send('🎮 **スリーマンセル人狼の準備が完了しました！**');
+    await mainText.send(RULE_TEXT);
+    await mainText.send(HOST_GUIDE_TEXT);
+
+    const currentCount = mainVoice.members ? mainVoice.members.filter(m => !m.user.bot).size : 0;
+    await mainText.send(`📢 **【参加者募集・待機中】**\n参加者12名全員が **「全体会議VC」** に入った状態で、再度このチャットで \`!jinro-start\` と入力するとゲームが始まります。（現在の接続人数: **${currentCount} / 12名**）`);
+
+    if (originChannel.id !== mainText.id) {
+      originChannel.send('スリーマンセル人狼の準備が完了しました。「全体議論チャット」をご確認ください。');
+    }
+  } catch (err) {
+    console.error(err);
+    originChannel.send('チャンネル生成エラーが発生しました。Botの権限を確認してください。');
+  }
+}
+
+// --- ゲーム本編スタートコマンド ---
+async function handleStartCommand(guild, originChannel, gameState) {
+  const mainVoice = gameState.channels.mainVoice;
+  const mainText = gameState.channels.mainText;
+
+  const targetVC = (mainVoice && mainVoice.members) ? mainVoice : originChannel.voice ? originChannel.voice.channel : null;
+  const vcMembers = targetVC ? targetVC.members.filter(m => !m.user.bot) : new Map();
+
+  if (vcMembers.size < 12) {
+    await mainText.send(`⚠️ **【人数不足】** 現在VCに接続されているプレイヤーは **${vcMembers.size} / 12名** です。\n参加者12名全員が **「全体会議VC」** に接続した状態で、再度 \`!jinro-start\` と入力してください。`);
+    return;
+  }
+
+  await startGame(guild, Array.from(vcMembers.values()).slice(0, 12), gameState);
+}
+
+// --- チーム割り当て・チームチャンネル生成 ---
+async function startGame(guild, memberArray, gameState) {
+  gameState.active = true;
+  gameState.dayCount = 0;
+  gameState.lastKilledTeam = null;
+  gameState.consecutiveKills = 0;
+  gameState.executedYesterday = null;
+
+  const shuffledMembers = memberArray.sort(() => Math.random() - 0.5);
+  const teamRoles = [ROLES.SEER, ROLES.MEDIUM, ROLES.CITIZEN, ROLES.WOLF].sort(() => Math.random() - 0.5);
+  const playerRoles = [];
+  teamRoles.forEach(role => playerRoles.push(role, role, role));
+
+  try {
     gameState.players = [];
     for (let i = 0; i < 12; i++) {
       const member = shuffledMembers[i];
@@ -169,32 +212,30 @@ async function setupAndStartGame(guild, originChannel, gameState) {
       const tText = await guild.channels.create({
         name: `${roleName}チーム-裏チャット`,
         type: ChannelType.GuildText,
-        parent: category.id,
+        parent: gameState.channels.category.id,
         permissionOverwrites: teamOverwrites
       });
 
       const tVoice = await guild.channels.create({
         name: `${roleName}チームVC`,
         type: ChannelType.GuildVoice,
-        parent: category.id,
+        parent: gameState.channels.category.id,
         permissionOverwrites: teamOverwrites
       });
 
       gameState.channels.teams[roleName] = { text: tText, voice: tVoice };
     }
 
-    await mainText.send('🎮 **スリーマンセル人狼が開始されました！**');
-    await mainText.send(RULE_TEXT);
-    await mainText.send(HOST_GUIDE_TEXT);
-
+    await gameState.channels.mainText.send('🚀 **12名が揃いました！役職を割り当て、チームVCを作成しました。第1夜を開始します！**');
     await startNightPhase(guild, gameState);
 
   } catch (err) {
     console.error(err);
-    originChannel.send('チャンネル生成権限エラーが発生しました。Botに管理者権限があるか確認してください。');
+    gameState.channels.mainText.send('チームチャンネル生成エラーが発生しました。');
   }
 }
 
+// --- 夜フェーズ ---
 async function startNightPhase(guild, gameState) {
   gameState.phase = 'NIGHT';
   gameState.dayCount++;
@@ -567,8 +608,6 @@ async function cleanUpAndReset(guild, gameState) {
 }
 
 console.log('🔑 Discordへログインを試みています...');
-console.log('読み込んだTOKENの文字数:', TOKEN ? TOKEN.length : 0);
-
 client.login(TOKEN).catch(err => {
   console.error('❌ Discordへのログインに失敗しました:', err);
 });
