@@ -566,4 +566,9 @@ async function cleanUpAndReset(guild, gameState) {
   resetGame(guild.id);
 }
 
-client.login(TOKEN);
+console.log('🔑 Discordへログインを試みています...');
+console.log('読み込んだTOKENの文字数:', TOKEN ? TOKEN.length : 0);
+
+client.login(TOKEN).catch(err => {
+  console.error('❌ Discordへのログインに失敗しました:', err);
+});
