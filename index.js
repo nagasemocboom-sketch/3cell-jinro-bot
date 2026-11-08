@@ -12,6 +12,8 @@ const {
   ChannelType, 
   ActionRowBuilder, 
   StringSelectMenuBuilder, 
+  ButtonBuilder,
+  ButtonStyle,
   ComponentType 
 } = require('discord.js');
 
@@ -51,9 +53,9 @@ const RULE_TEXT = `
   - 🐺 **人狼**: 毎夜1名を襲撃。
 
 ・**ゲームの流れ**:
-  - **夜**: チームVCで密談 ＆ 個人DMで能力実行（チーム内で早い者勝ち）。
+  - **夜(60秒)**: チームVCで密談 ＆ 個人DMで能力実行（チーム内で早い者勝ち）。
   - **朝**: 全員ミュートで犠牲者発表 → 5秒後に解除され昼議論へ。
-  - **昼**: 最多得票者を追放。同票時は【30秒の弁明タイム】→【当事者以外の生存者で決選投票】（再同票は追放なし）。
+  - **昼(最長5分)**: 全員が時短ボタンを押すと即投票開始。最多得票者を追放。同票時は【30秒の弁明タイム】→【当事者以外の生存者で決選投票】（再同票は追放なし）。
 --------------------------------------------------
 `;
 
@@ -85,6 +87,7 @@ function getGame(guildId) {
       consecutiveKills: 0,
       executedYesterday: null,
       votes: {},
+      shortenVotes: new Set(),
       nightActions: { seer: null, guard: null, wolf: null },
       nightActionSubmitted: { seer: false, guard: false, wolf: false },
       runoffCandidates: []
@@ -235,7 +238,7 @@ async function startGame(guild, memberArray, gameState) {
   }
 }
 
-// --- 夜フェーズ ---
+// --- 夜フェーズ (1分間) ---
 async function startNightPhase(guild, gameState) {
   gameState.phase = 'NIGHT';
   gameState.dayCount++;
@@ -243,7 +246,7 @@ async function startNightPhase(guild, gameState) {
   gameState.nightActionSubmitted = { seer: false, guard: false, wolf: false };
 
   const mainText = gameState.channels.mainText;
-  await mainText.send(`🌙 **【夜フェーズ (第${gameState.dayCount}夜)】**\n各チームは自動でチームVCへ移動しました。夜の行動を選択してください。`);
+  await mainText.send(`🌙 **【夜フェーズ (第${gameState.dayCount}夜 / 制限時間: 60秒)】**\n各チームは自動でチームVCへ移動しました。夜の行動を選択してください。`);
 
   for (const roleName of Object.values(ROLES)) {
     const team = gameState.channels.teams[roleName];
@@ -285,11 +288,12 @@ async function startNightPhase(guild, gameState) {
 
   sendNightActionMenus(guild, gameState);
 
+  // 夜フェーズタイマー（60秒）
   setTimeout(async () => {
     if (gameState.phase === 'NIGHT') {
       await processNightResults(guild, gameState);
     }
-  }, 45000);
+  }, 60000);
 }
 
 async function sendNightActionMenus(guild, gameState) {
@@ -321,7 +325,7 @@ async function sendNightActionMenus(guild, gameState) {
       const dm = await p.member.createDM();
       const msg = await dm.send({ content: `🌙 **【夜の行動選択】** (${p.role}能力):`, components: [row] });
 
-      const collector = msg.createMessageComponentCollector({ componentType: ComponentType.StringSelect, time: 40000 });
+      const collector = msg.createMessageComponentCollector({ componentType: ComponentType.StringSelect, time: 60000 });
       collector.on('collect', async (interaction) => {
         const key = p.role === ROLES.SEER ? 'seer' : p.role === ROLES.WOLF ? 'wolf' : 'guard';
         
@@ -417,10 +421,78 @@ async function processNightResults(guild, gameState) {
   }, 5000);
 }
 
+// --- 昼フェーズ（5分議論 ＋ 時短ボタン） ---
 async function startDayPhase(guild, gameState) {
-  gameState.phase = 'DAY';
+  gameState.phase = 'DAY_DISCUSSION';
+  gameState.shortenVotes = new Set();
   const mainText = gameState.channels.mainText;
-  await mainText.send(`☀️ **【昼フェーズ (第${gameState.dayCount}日目)】**\n全体VCで議論を行い、追放するプレイヤーを選んで投票してください。（制限時間: 60秒）`);
+
+  const alivePlayers = gameState.players.filter(p => p.alive);
+  const aliveCount = alivePlayers.length;
+
+  const shortenBtn = new ButtonBuilder()
+    .setCustomId('shorten_discussion')
+    .setLabel(`⏱️ 議論を切り上げる (${gameState.shortenVotes.size}/${aliveCount})`)
+    .setStyle(ButtonStyle.Secondary);
+
+  const row = new ActionRowBuilder().addComponents(shortenBtn);
+
+  const discMsg = await mainText.send({
+    content: `☀️ **【昼フェーズ - 議論 (第${gameState.dayCount}日目 / 制限時間: 5分)】**\n全体VCで議論を行ってください。\n生存者全員（${aliveCount}名）が下のボタンを押すと、即座に追放投票へ移行します。`,
+    components: [row]
+  });
+
+  let discussionEnded = false;
+
+  const goToVote = async () => {
+    if (discussionEnded) return;
+    discussionEnded = true;
+    collector.stop('discussion_over');
+    await startVotingPhase(guild, gameState);
+  };
+
+  // 5分（300,000ms）タイマー
+  const discTimer = setTimeout(goToVote, 300000);
+
+  const collector = discMsg.createMessageComponentCollector({ componentType: ComponentType.Button, time: 300000 });
+
+  collector.on('collect', async (interaction) => {
+    if (interaction.customId !== 'shorten_discussion') return;
+
+    const voter = gameState.players.find(p => p.id === interaction.user.id);
+    if (!voter || !voter.alive) {
+      return interaction.reply({ content: '生存者のみボタンを使用できます。', ephemeral: true });
+    }
+
+    if (gameState.shortenVotes.has(interaction.user.id)) {
+      gameState.shortenVotes.delete(interaction.user.id);
+      await interaction.reply({ content: '時短希望を取り消しました。', ephemeral: true });
+    } else {
+      gameState.shortenVotes.add(interaction.user.id);
+      await interaction.reply({ content: '時短希望を出しました。', ephemeral: true });
+    }
+
+    const currentAliveCount = gameState.players.filter(p => p.alive).length;
+    const updatedBtn = new ButtonBuilder()
+      .setCustomId('shorten_discussion')
+      .setLabel(`⏱️ 議論を切り上げる (${gameState.shortenVotes.size}/${currentAliveCount})`)
+      .setStyle(gameState.shortenVotes.size === currentAliveCount ? ButtonStyle.Success : ButtonStyle.Secondary);
+
+    const updatedRow = new ActionRowBuilder().addComponents(updatedBtn);
+    await discMsg.edit({ components: [updatedRow] }).catch(() => {});
+
+    if (gameState.shortenVotes.size >= currentAliveCount) {
+      clearTimeout(discTimer);
+      await mainText.send('⚡ **全員が時短ボタンを押したため、議論を終了して投票へ移行します！**');
+      await goToVote();
+    }
+  });
+}
+
+// --- 追放投票フェーズ (60秒) ---
+async function startVotingPhase(guild, gameState) {
+  gameState.phase = 'DAY_VOTE';
+  const mainText = gameState.channels.mainText;
 
   const alivePlayers = gameState.players.filter(p => p.alive);
   const selectMenu = new StringSelectMenuBuilder()
@@ -429,7 +501,7 @@ async function startDayPhase(guild, gameState) {
     .addOptions(alivePlayers.map(p => ({ label: p.name, value: p.id })));
 
   const row = new ActionRowBuilder().addComponents(selectMenu);
-  const voteMsg = await mainText.send({ content: '🗳️ **【追放投票】** 下のメニューから選択してください:', components: [row] });
+  const voteMsg = await mainText.send({ content: '🗳️ **【追放投票 / 制限時間: 60秒】** 下のメニューから追放したいプレイヤーを選択してください:', components: [row] });
 
   gameState.votes = {};
 
@@ -520,7 +592,7 @@ async function startRunoffVote(guild, gameState) {
     .addOptions(candidatePlayers.map(p => ({ label: p.name, value: p.id })));
 
   const row = new ActionRowBuilder().addComponents(selectMenu);
-  const voteMsg = await mainText.send({ content: '🗳️ **【決選投票】** 当事者以外の生存者は投票してください（制限時間: 30秒）:', components: [row] });
+  const voteMsg = await mainText.send({ content: '🗳️ **【決選投票 / 制限時間: 30秒】** 当事者以外の生存者は投票してください:', components: [row] });
 
   gameState.votes = {};
 
