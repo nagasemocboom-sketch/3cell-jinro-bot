@@ -1,0 +1,12 @@
+{
+  "name": "3cell-jinro-bot",
+  "version": "1.0.0",
+  "description": "スリーマンセル人狼 Discord Bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1"
+  }
+}
